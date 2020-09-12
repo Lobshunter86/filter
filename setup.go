@@ -12,6 +12,7 @@ import (
 	"github.com/caddyserver/caddy"
 	"github.com/coredns/coredns/core/dnsserver"
 	"github.com/coredns/coredns/plugin"
+	"github.com/coredns/coredns/plugin/pkg/log"
 )
 
 const (
@@ -20,7 +21,10 @@ const (
 	MYIP = "https://api.ipify.org?format=json"
 )
 
-func init() { plugin.Register("filter", setup) }
+func init() {
+	plugin.Register("filter", setup)
+	log.D.Set()
+}
 
 func setup(c *caddy.Controller) error {
 	c.Next() // skip plugin name
@@ -38,9 +42,10 @@ func setup(c *caddy.Controller) error {
 
 	// if Filter contains variable length data structure
 	// updates Filter concurrently might cause data inconsistent
-	go filter.updateLocalIP(time.Duration(interval) * time.Second)
+	filter.updateLocalIP()
 
 	files := c.RemainingArgs()
+
 	var ipTable []IPInfo
 	for i, f := range files {
 		ipinfos, err := extractIPs(f)
@@ -62,6 +67,8 @@ func setup(c *caddy.Controller) error {
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
 		return filter
 	})
+
+	go filter.localIPUpdator(time.Duration(interval) * time.Second)
 	return nil
 }
 
@@ -80,6 +87,7 @@ func extractIPs(filename string) ([]IPInfo, error) {
 		if len(line) < 4 {
 			continue
 		}
+		line = line[:len(line)-1]
 
 		ipLine := strings.Split(line, "/")
 		ipInfo := IP2IPInterval(ipLine[0], ipLine[1])

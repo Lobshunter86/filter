@@ -45,6 +45,7 @@ func (f *Filter) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
 	if rcode != dns.RcodeSuccess ||
 		err != nil ||
 		nw.Msg == nil {
+		log.Error("forward to query plugin error:", err)
 		return rcode, err
 	}
 
@@ -81,47 +82,50 @@ type myIP struct {
 	IP string `json:"ip,omitempty"`
 }
 
-func (f *Filter) updateLocalIP(interval time.Duration) {
-	// not using lock will cause data race, but won't affect correctness because assigning to uint32 is atomic
+func (f *Filter) localIPUpdator(interval time.Duration) {
 	ticker := time.Tick(interval)
-
 	for {
-		for i := 0; i < 3; i++ {
-			resp, err := http.Get(MYIP)
-			if err != nil {
-				log.Errorf("call ip api error: %v", err)
-				time.Sleep(10 * time.Second)
-			} else if resp.StatusCode != 200 {
-				log.Errorf("call ip api statuscode: %d", resp.StatusCode)
-				resp.Body.Close()
-				time.Sleep(10 * time.Second)
-			} else {
-				myip := myIP{}
+		f.updateLocalIP()
+		<-ticker
+	}
+}
 
-				decoder := json.NewDecoder(resp.Body)
-				err = decoder.Decode(&myip)
-				resp.Body.Close()
+func (f *Filter) updateLocalIP() {
+	// not using lock will cause data race, but won't affect correctness because assigning to uint32 is atomic
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(MYIP)
+		if err != nil {
+			log.Errorf("call ip api error: %v", err)
+			time.Sleep(10 * time.Second)
+		} else if resp.StatusCode != 200 {
+			log.Errorf("call ip api statuscode: %d", resp.StatusCode)
+			resp.Body.Close()
+			time.Sleep(10 * time.Second)
+		} else {
+			myip := myIP{}
 
-				if err == nil { // call api succeed, update local ip
-					ip := net.ParseIP(myip.IP)
-					f.localIP = IP2Int(ip)
-					localIPGroup := f.GetGroupOfIP(ip)
+			decoder := json.NewDecoder(resp.Body)
+			err = decoder.Decode(&myip)
+			resp.Body.Close()
 
-					// seperate default local group and defautl group
-					// ensures that if local group is not is configuration, no dns answer is gonna be filter
-					if localIPGroup != DEFAULT_IP_GROUP {
-						f.localIPGroup = localIPGroup
-					} else {
-						f.localIPGroup = DEFAULT_LOCAL_IP_GROUP
-					}
+			if err == nil { // call api succeed, update local ip
+				ip := net.ParseIP(myip.IP)
+				f.localIP = IP2Int(ip)
+				localIPGroup := f.GetGroupOfIP(ip)
 
-					break
+				// seperate default local group and defautl group
+				// ensures that if local group is not is configuration, no dns answer is gonna be filter
+				if localIPGroup != DEFAULT_IP_GROUP {
+					f.localIPGroup = localIPGroup
 				} else {
-					log.Errorf("update ip unmarshal error: %v", err)
+					f.localIPGroup = DEFAULT_LOCAL_IP_GROUP
 				}
+
+				break
+			} else {
+				log.Errorf("update ip unmarshal error: %v", err)
 			}
 		}
-		<-ticker
 	}
 }
 

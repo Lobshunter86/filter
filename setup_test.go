@@ -34,10 +34,20 @@ func TestUpdateLocalIP(t *testing.T) {
 
 	t.Log(f.localIP)
 
-	go f.updateLocalIP(duration)
+	go f.localIPUpdator(duration)
 	time.Sleep(duration * 2)
 
 	t.Log(f.localIP)
+}
+
+func TestExtractIP(t *testing.T) {
+	filename := "/home/lob/go/src/github.com/lobshunter86/filter/iptable/china_telecom.txt"
+	ipinfos, err := extractIPs(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log(ipinfos)
 }
 
 func TestDebug(t *testing.T) {
