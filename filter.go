@@ -2,18 +2,42 @@ package filter
 
 import (
 	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"time"
 
 	"github.com/coredns/coredns/plugin"
+	"github.com/coredns/coredns/plugin/pkg/log"
 	"github.com/coredns/coredns/plugin/pkg/nonwriter"
-
 	"github.com/miekg/dns"
 )
 
+const (
+	DEFAULT_IP_GROUP = iota
+	DEFAULT_LOCAL_IP_GROUP
+)
+
 type Filter struct {
-	Next plugin.Handler
+	Next         plugin.Handler
+	localIP      uint32 // data race but fine, read/write to int type wrong cause severe data inconsistent
+	localIPGroup uint64 // data race but fine
+
+	// iptable is only updted on startup, since then, it became read only
+	// write to iptable might cause index out of range panic
+	// if really need to, all reads to IPTable MUST use a new symbol to reference IPtable before access the data inside
+	IPTable []IPInfo
 }
 
-func (f Filter) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+type IPInfo struct {
+	start uint32
+	end   uint32
+	group uint64 // alignment
+}
+
+var _ plugin.Handler = &Filter{}
+
+func (f *Filter) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	nw := nonwriter.New(w)
 	rcode, err := plugin.NextOrFailure(f.Name(), f.Next, ctx, nw, r)
 
@@ -25,15 +49,16 @@ func (f Filter) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	}
 
 	answer := make([]dns.RR, 0, len(nw.Msg.Answer))
-	Acount := 0 // MUST use Acount instead of len(answer)
+	IPcount := 0 // MUST use IPcount instead of len(answer)
 	for _, record := range nw.Msg.Answer {
-		rr, ok := record.(*dns.A)
-		if ok {
+
+		if record.Header().Class == dns.TypeA {
+			rr := record.(*dns.A)
 			ip := rr.A
-			if IsSlowIP(ip) { // filter slow
-				continue
+			if f.IsGroupX(ip, f.localIPGroup) { // filter slow
+				IPcount++
 			} else {
-				Acount++
+				continue
 			}
 		}
 		// MUST append() here -> some answers are CNAME
@@ -41,7 +66,7 @@ func (f Filter) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 		answer = append(answer, record)
 	}
 
-	if Acount > 0 {
+	if IPcount > 0 {
 		nw.Msg.Answer = answer
 	}
 
@@ -50,4 +75,78 @@ func (f Filter) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 	return rcode, err
 }
 
-func (f Filter) Name() string { return "filter" }
+func (f *Filter) Name() string { return "filter" }
+
+type myIP struct {
+	IP string `json:"ip,omitempty"`
+}
+
+func (f *Filter) updateLocalIP(interval time.Duration) {
+	// not using lock will cause data race, but won't affect correctness because assigning to uint32 is atomic
+	ticker := time.Tick(interval)
+
+	for {
+		for i := 0; i < 3; i++ {
+			resp, err := http.Get(MYIP)
+			if err != nil {
+				log.Errorf("call ip api error: %v", err)
+				time.Sleep(10 * time.Second)
+			} else if resp.StatusCode != 200 {
+				log.Errorf("call ip api statuscode: %d", resp.StatusCode)
+				resp.Body.Close()
+				time.Sleep(10 * time.Second)
+			} else {
+				myip := myIP{}
+
+				decoder := json.NewDecoder(resp.Body)
+				err = decoder.Decode(&myip)
+				resp.Body.Close()
+
+				if err == nil { // call api succeed, update local ip
+					ip := net.ParseIP(myip.IP)
+					f.localIP = IP2Int(ip)
+					localIPGroup := f.GetGroupOfIP(ip)
+
+					// seperate default local group and defautl group
+					// ensures that if local group is not is configuration, no dns answer is gonna be filter
+					if localIPGroup != DEFAULT_IP_GROUP {
+						f.localIPGroup = localIPGroup
+					} else {
+						f.localIPGroup = DEFAULT_LOCAL_IP_GROUP
+					}
+
+					break
+				} else {
+					log.Errorf("update ip unmarshal error: %v", err)
+				}
+			}
+		}
+		<-ticker
+	}
+}
+
+// GetGroupOfIP returns group of ip base on config
+// default is DEFAULT_IP_GROUP(i.e. 0)
+func (f *Filter) GetGroupOfIP(ip net.IP) uint64 {
+	uIP := IP2Int(ip)
+
+	var l = 0
+	var r = len(f.IPTable) - 1
+	for l <= r {
+		var mid = int((l + r) / 2)
+		if uIP < f.IPTable[mid].start {
+			r = mid - 1
+		} else if uIP > f.IPTable[mid].end {
+			l = mid + 1
+		} else {
+			return f.IPTable[mid].group
+		}
+	}
+
+	return DEFAULT_IP_GROUP
+}
+
+func (f *Filter) IsGroupX(ip net.IP, group uint64) bool {
+	g := f.GetGroupOfIP(ip)
+	return g == group
+}
